@@ -1,4 +1,3 @@
-// Package gohotpool - Optimized version with near sync.Pool performance
 package gohotpool
 
 import (
@@ -13,7 +12,7 @@ const (
 	MaxUsageCount         = 5
 	DefaultPoolSize       = 1024
 	DefaultRingBufferSize = 32
-	DefaultShardCount     = 16 // New: shard the pool to reduce contention
+	DefaultShardCount     = 16
 )
 
 // BufferState represents the state of a buffer
@@ -25,7 +24,7 @@ const (
 	StateWriting
 )
 
-// BufferDescriptor - optimized with atomic operations instead of mutex
+// BufferDescriptor optimized with atomic operations instead of mutex
 type BufferDescriptor struct {
 	usageCount uint32 // atomic, 0-5
 	pinCount   uint32 // atomic
@@ -45,7 +44,7 @@ type perPCache struct {
 	_   [56]byte // padding to avoid false sharing
 }
 
-// Shard - each shard has its own lock to reduce contention
+// Shard each shard has its own lock to reduce contention
 type Shard struct {
 	buffers     []*Buffer
 	descriptors []*BufferDescriptor
@@ -54,27 +53,21 @@ type Shard struct {
 	_           [40]byte
 }
 
-// Pool - sharded for better concurrency
+// Pool sharded for better concurrency
 type Pool struct {
-	perP       []perPCache
-	numProcs   int
-	shards     []*Shard
-	shardCount int
-	shardMask  uint32
-
-	// sync.Pool fallback for overflow
-	overflow sync.Pool
-
-	// Ring buffer for bulk operations
-	ringBuffer *RingBuffer
-
-	// Statistics (optional, disabled by default for performance)
-	stats          *PoolStats
+	perP           []perPCache
+	numProcs       int
+	shards         []*Shard
+	shardCount     int
+	shardMask      uint32
+	overflow       sync.Pool
+	ringBuffer     *RingBuffer
+	stats          *PoolStats // disabled by default for performance
 	trackStats     bool
 	defaultBufSize int
 }
 
-// PoolStats - all atomic for lock-free updates
+// PoolStats all atomic for lock-free updates
 type PoolStats struct {
 	Gets           uint64
 	Puts           uint64
@@ -84,10 +77,10 @@ type PoolStats struct {
 	ClockSweeps    uint64
 	DirtyBuffers   uint64
 	RingBufferUses uint64
-	PerPHits       uint64 // track per-P cache hits
+	PerPHits       uint64
 }
 
-// RingBuffer - optimized with atomic operations
+// RingBuffer optimized with atomic operations
 type RingBuffer struct {
 	buffers []*Buffer
 	size    int
@@ -97,11 +90,11 @@ type RingBuffer struct {
 // Config for pool initialization
 type Config struct {
 	PoolSize          int
-	ShardCount        int // New: number of shards
+	ShardCount        int
 	EnableRingBuffer  bool
 	RingBufferSize    int
 	DefaultBufferSize int
-	TrackStats        bool // Default: false for max performance
+	TrackStats        bool // false by default for max performance
 }
 
 // DefaultConfig returns optimized defaults
@@ -201,15 +194,13 @@ func (p *Pool) newBuffer() *Buffer {
 	}
 }
 
-// Get - optimized with per-P fast path using atomic swap
+// Get optimized with per-P fast path using atomic swap
 func (p *Pool) Get() *Buffer {
+
 	if p.trackStats {
 		atomic.AddUint64(&p.stats.Gets, 1)
 	}
-
-	// // Fast path: try lock-free cache first
-	// if p.fastCache.New != nil {
-	// 	if buf := p.fastCache.Get().(*Buffer); buf != nil {
+	// Try per-P cache first
 	pid := runtime_procPin()
 	if pid < p.numProcs {
 
@@ -230,6 +221,7 @@ func (p *Pool) Get() *Buffer {
 	} else {
 		runtime_procUnpin()
 	}
+
 	if iface := p.overflow.Get(); iface != nil {
 		b := iface.(*Buffer)
 		b.B = b.B[:0]
@@ -273,7 +265,6 @@ func (p *Pool) getFromShard() *Buffer {
 		}
 	}
 
-	// Need eviction - use clock sweep
 	if p.trackStats {
 		atomic.AddUint64(&p.stats.Misses, 1)
 	}
@@ -298,7 +289,7 @@ func (p *Pool) getFromShard() *Buffer {
 	return buf
 }
 
-// clockSweepShard - optimized clock sweep on single shard (called with mutex held)
+// clockSweepShard  optimized clock sweep on single shard (called with mutex held)
 func (p *Pool) clockSweepShard(shard *Shard) int {
 	if p.trackStats {
 		atomic.AddUint64(&p.stats.ClockSweeps, 1)
@@ -339,7 +330,7 @@ func (p *Pool) clockSweepShard(shard *Shard) int {
 	return 0
 }
 
-// Put - optimized with per-P fast path using atomic compare-and-swap
+// Put  optimized with per-P fast path using atomic compare-and-swap
 func (p *Pool) Put(buf *Buffer) {
 	if buf == nil {
 		return
@@ -372,7 +363,7 @@ func (p *Pool) Put(buf *Buffer) {
 	p.overflow.Put(buf)
 }
 
-// GetCold - optimized ring buffer with atomic operations
+// GetCold  optimized ring buffer with atomic operations
 func (p *Pool) GetCold() *Buffer {
 	if p.ringBuffer == nil {
 		return p.Get()
@@ -406,24 +397,24 @@ func (p *Pool) PutCold(buf *Buffer) {
 
 }
 
-// Pin - atomic increment
+// Pin atomic increment
 func (p *Pool) Pin(buf *Buffer) {
 	atomic.AddUint32(&buf.desc.pinCount, 1)
 }
 
-// Unpin - atomic decrement
+// Unpin atomic decrement
 func (p *Pool) Unpin(buf *Buffer) {
 	if atomic.LoadUint32(&buf.desc.pinCount) > 0 {
 		atomic.AddUint32(&buf.desc.pinCount, ^uint32(0))
 	}
 }
 
-// MarkDirty - atomic state update
+// MarkDirty atomic state update
 func (p *Pool) MarkDirty(buf *Buffer) {
 	atomic.StoreUint32(&buf.desc.state, uint32(StateDirty))
 }
 
-// GetStats - returns copy of stats
+// GetStats returns copy of stats
 func (p *Pool) GetStats() PoolStats {
 	if !p.trackStats || p.stats == nil {
 		return PoolStats{}
@@ -544,7 +535,7 @@ func nextPowerOf2(n int) int {
 var rngState uint32 = 1
 
 func fastRand() uint32 {
-	s := atomic.AddUint32(&rngState, 0x9E3779B9) // goldern ratio
+	s := atomic.AddUint32(&rngState, 0x9E3779B9) // golden ratio
 	s ^= s >> 16
 	s *= 0x85ebca6b
 	s ^= s >> 13
@@ -560,9 +551,6 @@ func runtime_procPin() int
 //go:linkname runtime_procUnpin runtime.procUnpin
 func runtime_procUnpin()
 
-// ============================================================================
-// DEFAULT POOL WRAPPERS
-// ============================================================================
 // Default pool
 var defaultPool = NewPool(DefaultConfig())
 
