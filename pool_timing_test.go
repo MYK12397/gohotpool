@@ -7,7 +7,9 @@ import (
 )
 
 func BenchmarkOptimized_Get_Parallel(b *testing.B) {
-	pool := NewPool(DefaultConfig())
+	config := DefaultConfig()
+	config.TrackStats = true // Include stats overhead
+	pool := NewPool(config)
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
@@ -25,6 +27,7 @@ func BenchmarkOptimized_GetCold_Parallel(b *testing.B) {
 		for pb.Next() {
 			buf := pool.GetCold()
 			buf.WriteString("benchmark")
+			pool.PutCold(buf)
 		}
 	})
 }
@@ -43,9 +46,9 @@ func BenchmarkOptimized_NoStats_Parallel(b *testing.B) {
 	})
 }
 
-func BenchmarkOptimized_FastCacheOnly_Parallel(b *testing.B) {
+// BenchmarkOptimized_PerPCache_Parallel tests the per-P cache fast path
+func BenchmarkOptimized_PerPCache_Parallel(b *testing.B) {
 	config := DefaultConfig()
-	config.EnableFastCache = true
 	config.TrackStats = false
 	pool := NewPool(config)
 	b.ResetTimer()
@@ -75,7 +78,7 @@ func BenchmarkOptimized_ManyShards_Parallel(b *testing.B) {
 
 func BenchmarkSyncPool_Parallel(b *testing.B) {
 	pool := &sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			return &bytes.Buffer{}
 		},
 	}
@@ -91,7 +94,9 @@ func BenchmarkSyncPool_Parallel(b *testing.B) {
 }
 
 func BenchmarkOptimized_HTTPResponse(b *testing.B) {
-	pool := NewPool(DefaultConfig())
+	config := DefaultConfig()
+	config.TrackStats = false
+	pool := NewPool(config)
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
@@ -108,7 +113,7 @@ func BenchmarkOptimized_HTTPResponse(b *testing.B) {
 
 func BenchmarkSyncPool_HTTPResponse(b *testing.B) {
 	pool := &sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			return &bytes.Buffer{}
 		},
 	}
@@ -134,12 +139,13 @@ func BenchmarkOptimized_BulkCSV(b *testing.B) {
 		buf := pool.GetCold()
 		buf.WriteString("1,fil dune,fdune@example.com,100\n")
 		_ = buf.Bytes()
+		pool.PutCold(buf)
 	}
 }
 
 func BenchmarkSyncPool_BulkCSV(b *testing.B) {
 	pool := &sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			return &bytes.Buffer{}
 		},
 	}
@@ -156,6 +162,7 @@ func BenchmarkSyncPool_BulkCSV(b *testing.B) {
 func BenchmarkOptimized_HighContention(b *testing.B) {
 	config := DefaultConfig()
 	config.PoolSize = 10 // Small pool
+	config.TrackStats = false
 	pool := NewPool(config)
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -170,6 +177,7 @@ func BenchmarkOptimized_HighContention(b *testing.B) {
 func BenchmarkOptimized_LowContention(b *testing.B) {
 	config := DefaultConfig()
 	config.PoolSize = 10000 // Large pool
+	config.TrackStats = false
 	pool := NewPool(config)
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -182,7 +190,9 @@ func BenchmarkOptimized_LowContention(b *testing.B) {
 }
 
 func BenchmarkOptimized_SmallWrites(b *testing.B) {
-	pool := NewPool(DefaultConfig())
+	config := DefaultConfig()
+	config.TrackStats = false
+	pool := NewPool(config)
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
@@ -194,7 +204,9 @@ func BenchmarkOptimized_SmallWrites(b *testing.B) {
 }
 
 func BenchmarkOptimized_MediumWrites(b *testing.B) {
-	pool := NewPool(DefaultConfig())
+	config := DefaultConfig()
+	config.TrackStats = false
+	pool := NewPool(config)
 	data := make([]byte, 1024)
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -207,7 +219,9 @@ func BenchmarkOptimized_MediumWrites(b *testing.B) {
 }
 
 func BenchmarkOptimized_LargeWrites(b *testing.B) {
-	pool := NewPool(DefaultConfig())
+	config := DefaultConfig()
+	config.TrackStats = false
+	pool := NewPool(config)
 	data := make([]byte, 64*1024)
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -217,6 +231,35 @@ func BenchmarkOptimized_LargeWrites(b *testing.B) {
 			pool.Put(buf)
 		}
 	})
+}
+
+// BenchmarkOptimized_GetPut_SingleGoroutine tests single-goroutine performance
+// to measure the true fast-path latency without contention
+func BenchmarkOptimized_GetPut_SingleGoroutine(b *testing.B) {
+	config := DefaultConfig()
+	config.TrackStats = false
+	pool := NewPool(config)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buf := pool.Get()
+		buf.WriteString("test")
+		pool.Put(buf)
+	}
+}
+
+func BenchmarkSyncPool_SingleGoroutine(b *testing.B) {
+	pool := &sync.Pool{
+		New: func() any {
+			return &bytes.Buffer{}
+		},
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buf := pool.Get().(*bytes.Buffer)
+		buf.WriteString("test")
+		buf.Reset()
+		pool.Put(buf)
+	}
 }
 
 func BenchmarkComparison_Generate(b *testing.B) {

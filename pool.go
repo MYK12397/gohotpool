@@ -3,9 +3,10 @@ package gohotpool
 
 import (
 	"io"
+	"runtime"
 	"sync"
 	"sync/atomic"
-	"time"
+	"unsafe"
 )
 
 const (
@@ -29,9 +30,7 @@ type BufferDescriptor struct {
 	usageCount uint32 // atomic, 0-5
 	pinCount   uint32 // atomic
 	state      uint32 // atomic BufferState
-	lastUsed   int64  // atomic unix nano
-	totalUses  uint64 // atomic
-	valid      uint32 // atomic bool (0 or 1)
+	_          uint32 // padding for alignment
 }
 
 // Buffer represents a byte buffer with metadata
@@ -41,29 +40,38 @@ type Buffer struct {
 	pool *Pool
 }
 
+type perPCache struct {
+	buf unsafe.Pointer
+	_   [56]byte // padding to avoid false sharing
+}
+
 // Shard - each shard has its own lock to reduce contention
 type Shard struct {
 	buffers     []*Buffer
 	descriptors []*BufferDescriptor
 	clockHand   uint32 // atomic
 	mu          sync.Mutex
+	_           [40]byte
 }
 
 // Pool - sharded for better concurrency
 type Pool struct {
+	perP       []perPCache
+	numProcs   int
 	shards     []*Shard
 	shardCount int
 	shardMask  uint32
 
-	// Fast path cache (like sync.Pool)
-	fastCache sync.Pool
+	// sync.Pool fallback for overflow
+	overflow sync.Pool
 
 	// Ring buffer for bulk operations
 	ringBuffer *RingBuffer
 
-	// Statistics (optional, can be disabled)
-	stats      *PoolStats
-	trackStats bool
+	// Statistics (optional, disabled by default for performance)
+	stats          *PoolStats
+	trackStats     bool
+	defaultBufSize int
 }
 
 // PoolStats - all atomic for lock-free updates
@@ -76,6 +84,7 @@ type PoolStats struct {
 	ClockSweeps    uint64
 	DirtyBuffers   uint64
 	RingBufferUses uint64
+	PerPHits       uint64 // track per-P cache hits
 }
 
 // RingBuffer - optimized with atomic operations
@@ -92,8 +101,7 @@ type Config struct {
 	EnableRingBuffer  bool
 	RingBufferSize    int
 	DefaultBufferSize int
-	TrackStats        bool // New: disable for max performance
-	EnableFastCache   bool // New: sync.Pool-like fast path
+	TrackStats        bool // Default: false for max performance
 }
 
 // DefaultConfig returns optimized defaults
@@ -104,8 +112,7 @@ func DefaultConfig() Config {
 		EnableRingBuffer:  true,
 		RingBufferSize:    DefaultRingBufferSize,
 		DefaultBufferSize: 4096,
-		TrackStats:        true,
-		EnableFastCache:   true,
+		TrackStats:        false,
 	}
 }
 
@@ -124,18 +131,29 @@ func NewPool(config Config) *Pool {
 	// Ensure shard count is power of 2 for fast masking
 	shardCount := nextPowerOf2(config.ShardCount)
 	buffersPerShard := config.PoolSize / shardCount
+	if buffersPerShard < 1 {
+		buffersPerShard = 1
+	}
+	numProcs := runtime.GOMAXPROCS(0)
 
 	pool := &Pool{
-		shards:     make([]*Shard, shardCount),
-		shardCount: shardCount,
-		shardMask:  uint32(shardCount - 1),
-		trackStats: config.TrackStats,
+		perP:           make([]perPCache, numProcs),
+		numProcs:       numProcs,
+		shards:         make([]*Shard, shardCount),
+		shardCount:     shardCount,
+		shardMask:      uint32(shardCount - 1),
+		trackStats:     config.TrackStats,
+		defaultBufSize: config.DefaultBufferSize,
 	}
 
 	if config.TrackStats {
 		pool.stats = &PoolStats{}
 	}
 
+	for i := 0; i < numProcs; i++ {
+		buf := pool.newBuffer()
+		atomic.StorePointer(&pool.perP[i].buf, unsafe.Pointer(buf))
+	}
 	// Initialize shards
 	for i := 0; i < shardCount; i++ {
 		shard := &Shard{
@@ -144,7 +162,9 @@ func NewPool(config Config) *Pool {
 		}
 
 		for j := 0; j < buffersPerShard; j++ {
-			shard.descriptors[j] = &BufferDescriptor{}
+			shard.descriptors[j] = &BufferDescriptor{
+				usageCount: 1,
+			}
 			shard.buffers[j] = &Buffer{
 				B:    make([]byte, 0, config.DefaultBufferSize),
 				desc: shard.descriptors[j],
@@ -155,15 +175,8 @@ func NewPool(config Config) *Pool {
 		pool.shards[i] = shard
 	}
 
-	// Initialize fast cache if enabled
-	if config.EnableFastCache {
-		pool.fastCache.New = func() interface{} {
-			return &Buffer{
-				B:    make([]byte, 0, config.DefaultBufferSize),
-				desc: &BufferDescriptor{},
-				pool: pool,
-			}
-		}
+	pool.overflow.New = func() interface{} {
+		return pool.newBuffer()
 	}
 
 	// Initialize ring buffer
@@ -173,75 +186,89 @@ func NewPool(config Config) *Pool {
 			size:    config.RingBufferSize,
 		}
 		for i := 0; i < config.RingBufferSize; i++ {
-			pool.ringBuffer.buffers[i] = &Buffer{
-				B:    make([]byte, 0, config.DefaultBufferSize),
-				desc: &BufferDescriptor{},
-				pool: pool,
-			}
+			pool.ringBuffer.buffers[i] = pool.newBuffer()
 		}
 	}
 
 	return pool
 }
 
-// Get - optimized with fast path
+func (p *Pool) newBuffer() *Buffer {
+	return &Buffer{
+		B:    make([]byte, 0, p.defaultBufSize),
+		desc: &BufferDescriptor{usageCount: 1},
+		pool: p,
+	}
+}
+
+// Get - optimized with per-P fast path using atomic swap
 func (p *Pool) Get() *Buffer {
 	if p.trackStats {
 		atomic.AddUint64(&p.stats.Gets, 1)
 	}
 
-	// Fast path: try lock-free cache first
-	if p.fastCache.New != nil {
-		if buf := p.fastCache.Get().(*Buffer); buf != nil {
+	// // Fast path: try lock-free cache first
+	// if p.fastCache.New != nil {
+	// 	if buf := p.fastCache.Get().(*Buffer); buf != nil {
+	pid := runtime_procPin()
+	if pid < p.numProcs {
+
+		ptr := atomic.SwapPointer(&p.perP[pid].buf, nil)
+		runtime_procUnpin()
+		if ptr != nil {
+			buf := (*Buffer)(ptr)
 			buf.B = buf.B[:0]
 			atomic.StoreUint32(&buf.desc.state, uint32(StateClean))
 			atomic.StoreUint32(&buf.desc.pinCount, 1)
-			atomic.AddUint32(&buf.desc.usageCount, 1)
-			if atomic.LoadUint32(&buf.desc.usageCount) > MaxUsageCount {
-				atomic.StoreUint32(&buf.desc.usageCount, MaxUsageCount)
-			}
-			atomic.StoreInt64(&buf.desc.lastUsed, time.Now().UnixNano())
 
 			if p.trackStats {
+				atomic.AddUint64(&p.stats.PerPHits, 1)
 				atomic.AddUint64(&p.stats.Hits, 1)
 			}
 			return buf
 		}
+	} else {
+		runtime_procUnpin()
 	}
+	if iface := p.overflow.Get(); iface != nil {
+		b := iface.(*Buffer)
+		b.B = b.B[:0]
+		atomic.StoreUint32(&b.desc.state, uint32(StateClean))
+		atomic.StoreUint32(&b.desc.pinCount, 1)
 
+		if p.trackStats {
+			atomic.AddUint64(&p.stats.Hits, 1)
+		}
+		return b
+	}
 	// Slow path: get from sharded pool
 	return p.getFromShard()
 }
 
 // getFromShard - optimized shard selection
 func (p *Pool) getFromShard() *Buffer {
-	// Use goroutine ID approximation for shard selection
+	// Use fast random for shard selection
 	shardIdx := fastRand() & p.shardMask
 	shard := p.shards[shardIdx]
 
 	shard.mu.Lock()
-	defer shard.mu.Unlock()
 
 	// Fast scan for unpinned clean buffer
 	for _, buf := range shard.buffers {
-		pinCount := atomic.LoadUint32(&buf.desc.pinCount)
-		state := atomic.LoadUint32(&buf.desc.state)
-		valid := atomic.LoadUint32(&buf.desc.valid)
 
-		if pinCount == 0 && state == uint32(StateClean) && valid == 1 {
-			atomic.StoreUint32(&buf.desc.pinCount, 1)
-
-			usage := atomic.AddUint32(&buf.desc.usageCount, 1)
-			if usage > MaxUsageCount {
-				atomic.StoreUint32(&buf.desc.usageCount, MaxUsageCount)
+		if buf.desc.pinCount == 0 && buf.desc.state == uint32(StateClean) {
+			buf.desc.pinCount = 1
+			buf.desc.usageCount++
+			if buf.desc.usageCount > MaxUsageCount {
+				buf.desc.usageCount = MaxUsageCount
 			}
-
-			atomic.StoreInt64(&buf.desc.lastUsed, time.Now().UnixNano())
-			atomic.AddUint64(&buf.desc.totalUses, 1)
+			shard.mu.Unlock()
+			buf.B = buf.B[:0]
 
 			if p.trackStats {
 				atomic.AddUint64(&p.stats.Hits, 1)
 			}
+
 			return buf
 		}
 	}
@@ -255,45 +282,45 @@ func (p *Pool) getFromShard() *Buffer {
 	buf := shard.buffers[victimIdx]
 
 	// Handle dirty buffer
-	if atomic.LoadUint32(&buf.desc.state) == uint32(StateDirty) {
+	if buf.desc.state == uint32(StateDirty) {
 		if p.trackStats {
 			atomic.AddUint64(&p.stats.DirtyBuffers, 1)
 		}
 	}
 
-	// Reset buffer
+	// Reset buffer (direct access under mutex)
 	buf.B = buf.B[:0]
-	atomic.StoreUint32(&buf.desc.pinCount, 1)
-	atomic.StoreUint32(&buf.desc.usageCount, 1)
-	atomic.StoreUint32(&buf.desc.state, uint32(StateClean))
-	atomic.StoreUint32(&buf.desc.valid, 1)
-	atomic.StoreInt64(&buf.desc.lastUsed, time.Now().UnixNano())
-	atomic.AddUint64(&buf.desc.totalUses, 1)
+	buf.desc.pinCount = 1
+	buf.desc.usageCount = 1
+	buf.desc.state = uint32(StateClean)
 
+	shard.mu.Unlock()
 	return buf
 }
 
-// clockSweepShard - optimized clock sweep on single shard
+// clockSweepShard - optimized clock sweep on single shard (called with mutex held)
 func (p *Pool) clockSweepShard(shard *Shard) int {
 	if p.trackStats {
 		atomic.AddUint64(&p.stats.ClockSweeps, 1)
 	}
 
 	size := len(shard.buffers)
+	if size == 0 {
+		return 0
+	}
 	maxSweeps := size * 2
 
 	for i := 0; i < maxSweeps; i++ {
+		//atomic increment for clock hand (can be accessed during stats)
 		hand := atomic.AddUint32(&shard.clockHand, 1) % uint32(size)
 		desc := shard.descriptors[hand]
 
-		pinCount := atomic.LoadUint32(&desc.pinCount)
-		if pinCount > 0 {
+		if desc.pinCount > 0 {
 			continue
 		}
 
-		usageCount := atomic.LoadUint32(&desc.usageCount)
-		if usageCount > 0 {
-			atomic.AddUint32(&desc.usageCount, ^uint32(0)) // decrement
+		if desc.usageCount > 0 {
+			desc.usageCount--
 			continue
 		}
 
@@ -305,14 +332,14 @@ func (p *Pool) clockSweepShard(shard *Shard) int {
 
 	// Fallback: return first unpinned
 	for i := range shard.buffers {
-		if atomic.LoadUint32(&shard.descriptors[i].pinCount) == 0 {
+		if shard.descriptors[i].pinCount == 0 {
 			return i
 		}
 	}
 	return 0
 }
 
-// Put - optimized with fast path
+// Put - optimized with per-P fast path using atomic compare-and-swap
 func (p *Pool) Put(buf *Buffer) {
 	if buf == nil {
 		return
@@ -323,17 +350,26 @@ func (p *Pool) Put(buf *Buffer) {
 	}
 
 	// Decrement pin count
-	pinCount := atomic.AddUint32(&buf.desc.pinCount, ^uint32(0)) // decrement
-
-	// Fast path: return to sync.Pool cache
-	if p.fastCache.New != nil && pinCount == 0 {
-		buf.B = buf.B[:0]
-		atomic.StoreUint32(&buf.desc.state, uint32(StateClean))
-		p.fastCache.Put(buf)
+	newPinCount := atomic.AddUint32(&buf.desc.pinCount, ^uint32(0)) // decrement
+	if newPinCount != 0 {
+		// Still pinned, cannot return to pool
 		return
 	}
 
-	// Buffer stays in shard, just unpinned
+	buf.B = buf.B[:0]
+	atomic.StoreUint32(&buf.desc.state, uint32(StateClean))
+
+	// Try to store in per-P cache
+	pid := runtime_procPin()
+	if pid < p.numProcs {
+		if atomic.CompareAndSwapPointer(&p.perP[pid].buf, nil, unsafe.Pointer(buf)) {
+			runtime_procUnpin()
+			return
+		}
+	}
+	runtime_procUnpin()
+
+	p.overflow.Put(buf)
 }
 
 // GetCold - optimized ring buffer with atomic operations
@@ -346,15 +382,28 @@ func (p *Pool) GetCold() *Buffer {
 		atomic.AddUint64(&p.stats.RingBufferUses, 1)
 	}
 
-	idx := atomic.AddUint32(&p.ringBuffer.current, 1) % uint32(p.ringBuffer.size)
-	buf := p.ringBuffer.buffers[idx]
+	for attempts := 0; attempts < p.ringBuffer.size*2; attempts++ {
+		idx := atomic.AddUint32(&p.ringBuffer.current, 1) % uint32(p.ringBuffer.size)
+		buf := p.ringBuffer.buffers[idx]
 
+		if atomic.CompareAndSwapUint32(&buf.desc.pinCount, 0, 1) {
+			buf.B = buf.B[:0]
+			atomic.StoreUint32(&buf.desc.state, uint32(StateClean))
+			return buf
+		}
+	}
+	//all buffer slots are in use, fallback to regular Get
+	return p.Get()
+}
+
+func (p *Pool) PutCold(buf *Buffer) {
+	if buf == nil {
+		return
+	}
 	buf.B = buf.B[:0]
 	atomic.StoreUint32(&buf.desc.state, uint32(StateClean))
-	atomic.StoreUint32(&buf.desc.valid, 1)
-	atomic.StoreInt64(&buf.desc.lastUsed, time.Now().UnixNano())
+	atomic.StoreUint32(&buf.desc.pinCount, 0) // unpin
 
-	return buf
 }
 
 // Pin - atomic increment
@@ -389,6 +438,7 @@ func (p *Pool) GetStats() PoolStats {
 		ClockSweeps:    atomic.LoadUint64(&p.stats.ClockSweeps),
 		DirtyBuffers:   atomic.LoadUint64(&p.stats.DirtyBuffers),
 		RingBufferUses: atomic.LoadUint64(&p.stats.RingBufferUses),
+		PerPHits:       atomic.LoadUint64(&p.stats.PerPHits),
 	}
 }
 
@@ -415,6 +465,7 @@ func (b *Buffer) WriteByte(c byte) error {
 func (b *Buffer) Bytes() []byte  { return b.B }
 func (b *Buffer) String() string { return string(b.B) }
 func (b *Buffer) Len() int       { return len(b.B) }
+func (b *Buffer) Cap() int       { return cap(b.B) }
 
 func (b *Buffer) Reset() {
 	b.B = b.B[:0]
@@ -422,24 +473,25 @@ func (b *Buffer) Reset() {
 }
 
 func (b *Buffer) ReadFrom(r io.Reader) (int64, error) {
-	n := int64(len(b.B))
+	startLen := len(b.B)
 	for {
 		if len(b.B) == cap(b.B) {
-			newBuf := make([]byte, len(b.B), 2*cap(b.B)+1)
+			newCap := cap(b.B)*2 + 512
+			newBuf := make([]byte, len(b.B), newCap)
 			copy(newBuf, b.B)
 			b.B = newBuf
 		}
 		m, err := r.Read(b.B[len(b.B):cap(b.B)])
 		b.B = b.B[:len(b.B)+m]
-		n += int64(m)
+
 		if err != nil {
 			if err == io.EOF {
 				err = nil
 			}
-			if m > 0 {
+			if len(b.B) > startLen {
 				atomic.StoreUint32(&b.desc.state, uint32(StateDirty))
 			}
-			return n - int64(len(b.B)), err
+			return int64(len(b.B) - startLen), err
 		}
 	}
 }
@@ -461,6 +513,17 @@ func (b *Buffer) PinCount() int32 {
 	return int32(atomic.LoadUint32(&b.desc.pinCount))
 }
 
+// Grow ensures buffer has at least n bytes of capacity
+func (b *Buffer) Grow(n int) {
+	if cap(b.B)-len(b.B) >= n {
+		return
+	}
+	newCap := len(b.B) + n
+	newBuf := make([]byte, len(b.B), newCap)
+	copy(newBuf, b.B)
+	b.B = newBuf
+}
+
 // Utility functions
 
 // nextPowerOf2 returns the next power of 2 >= n
@@ -478,23 +541,36 @@ func nextPowerOf2(n int) int {
 	return n
 }
 
-// fastRand - fast random number for shard selection
-var rngSeed uint32 = 1
+var rngState uint32 = 1
 
 func fastRand() uint32 {
-	// XorShift32
-	seed := atomic.LoadUint32(&rngSeed)
-	seed ^= seed << 13
-	seed ^= seed >> 17
-	seed ^= seed << 5
-	atomic.StoreUint32(&rngSeed, seed)
-	return seed
+	s := atomic.AddUint32(&rngState, 0x9E3779B9) // goldern ratio
+	s ^= s >> 16
+	s *= 0x85ebca6b
+	s ^= s >> 13
+	s *= 0xc2b2ae35
+	s ^= s >> 16
+
+	return s
 }
 
+//go:linkname runtime_procPin runtime.procPin
+func runtime_procPin() int
+
+//go:linkname runtime_procUnpin runtime.procUnpin
+func runtime_procUnpin()
+
+// ============================================================================
+// DEFAULT POOL WRAPPERS
+// ============================================================================
 // Default pool
 var defaultPool = NewPool(DefaultConfig())
 
-func Get() *Buffer        { return defaultPool.Get() }
-func Put(buf *Buffer)     { defaultPool.Put(buf) }
-func GetCold() *Buffer    { return defaultPool.GetCold() }
-func GetStats() PoolStats { return defaultPool.GetStats() }
+func Get() *Buffer          { return defaultPool.Get() }
+func Put(buf *Buffer)       { defaultPool.Put(buf) }
+func GetCold() *Buffer      { return defaultPool.GetCold() }
+func PutCold(buf *Buffer)   { defaultPool.PutCold(buf) }
+func GetStats() PoolStats   { return defaultPool.GetStats() }
+func Pin(buf *Buffer)       { defaultPool.Pin(buf) }
+func Unpin(buf *Buffer)     { defaultPool.Unpin(buf) }
+func MarkDirty(buf *Buffer) { defaultPool.MarkDirty(buf) }
