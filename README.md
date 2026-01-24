@@ -379,11 +379,3 @@ Contributions are welcome! Please feel free to submit a Pull Request.
  
 MIT License - see LICENSE file for details
  
-## Acknowledgments
- 
-Inspired by:
-- PostgreSQL's buffer management system
-- Go's sync.Pool implementation (per-P caching)
-- [valyala/bytebufferpool](https://github.com/valyala/bytebufferpool)
-- [vmihailenco/bufpool](https://github.com/vmihailenco/bufpool)
- 
