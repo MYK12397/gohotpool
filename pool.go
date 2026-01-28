@@ -433,8 +433,6 @@ func (p *Pool) GetStats() PoolStats {
 	}
 }
 
-// Buffer methods (optimized)
-
 func (b *Buffer) Write(p []byte) (int, error) {
 	b.B = append(b.B, p...)
 	atomic.StoreUint32(&b.desc.state, uint32(StateDirty))

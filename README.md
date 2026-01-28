@@ -317,17 +317,6 @@ defer gohotpool.Put(buf)
 stats := gohotpool.GetStats()       // Know what's happening
 ```
  
-## v2.0 Optimizations
- 
-This version includes major performance improvements:
- 
-1. **Per-P (processor) local caching** - Lock-free fast path like sync.Pool
-2. **Atomic swap/CAS operations** - Race-free per-P cache access
-3. **Removed time.Now() calls** - Saved ~30ns per operation
-4. **Stats disabled by default** - 34x performance improvement
-5. **Fixed data races** - All operations verified with `-race` detector
-6. **Fixed bugs** - fastRand, GetCold pinning, ReadFrom return value
- 
 ## API Reference
  
 ### Pool Methods
