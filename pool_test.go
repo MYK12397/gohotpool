@@ -64,7 +64,7 @@ func TestOptimized_RingBuffer(t *testing.T) {
 		if len(buf.B) == 0 {
 			t.Error("Ring buffer write failed")
 		}
-		pool.PutCold(buf)
+		pool.PutCold(buf) // NEW: Must put cold buffers back
 	}
 
 	stats := pool.GetStats()
@@ -112,7 +112,7 @@ func TestOptimized_ReadFrom(t *testing.T) {
 	buf := pool.Get()
 
 	// Test ReadFrom with known data
-	data := []byte("this is something new")
+	data := []byte("hello world this is a test")
 	reader := bytes.NewReader(data)
 
 	n, err := buf.ReadFrom(reader)
@@ -177,18 +177,17 @@ func TestOptimized_ColdBuffer_Concurrent(t *testing.T) {
 func TestOptimized_WriteTo(t *testing.T) {
 	pool := NewPool(DefaultConfig())
 	buf := pool.Get()
-	str := "this is something new"
-	buf.WriteString(str)
+	buf.WriteString("hello world")
 
 	var out bytes.Buffer
 	n, err := buf.WriteTo(&out)
 	if err != nil {
 		t.Errorf("WriteTo error: %v", err)
 	}
-	if n != int64(len(str)) {
+	if n != int64(len("hello world")) {
 		t.Errorf("WriteTo wrong count: got %d", n)
 	}
-	if out.String() != str {
+	if out.String() != "hello world" {
 		t.Errorf("WriteTo wrong content: got %q", out.String())
 	}
 

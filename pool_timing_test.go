@@ -78,7 +78,7 @@ func BenchmarkOptimized_ManyShards_Parallel(b *testing.B) {
 
 func BenchmarkSyncPool_Parallel(b *testing.B) {
 	pool := &sync.Pool{
-		New: func() any {
+		New: func() interface{} {
 			return &bytes.Buffer{}
 		},
 	}
@@ -113,7 +113,7 @@ func BenchmarkOptimized_HTTPResponse(b *testing.B) {
 
 func BenchmarkSyncPool_HTTPResponse(b *testing.B) {
 	pool := &sync.Pool{
-		New: func() any {
+		New: func() interface{} {
 			return &bytes.Buffer{}
 		},
 	}
@@ -145,7 +145,7 @@ func BenchmarkOptimized_BulkCSV(b *testing.B) {
 
 func BenchmarkSyncPool_BulkCSV(b *testing.B) {
 	pool := &sync.Pool{
-		New: func() any {
+		New: func() interface{} {
 			return &bytes.Buffer{}
 		},
 	}
@@ -249,7 +249,7 @@ func BenchmarkOptimized_GetPut_SingleGoroutine(b *testing.B) {
 
 func BenchmarkSyncPool_SingleGoroutine(b *testing.B) {
 	pool := &sync.Pool{
-		New: func() any {
+		New: func() interface{} {
 			return &bytes.Buffer{}
 		},
 	}
